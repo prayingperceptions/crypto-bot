@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  kalshi-arb-bot:
+    build: .
+    container_name: crypto_bot_core
+    restart: unless-stopped
+    env_file:
+      - .env
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

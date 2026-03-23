@@ -1,0 +1,8 @@
+aiohttp
+websockets
+python-dotenv
+ccxt
+cryptography
+scipy
+numpy
+aiosqlite

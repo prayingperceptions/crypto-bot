@@ -9,9 +9,8 @@ logger = setup_logger("binance_ws")
 class BinanceWSClient:
     def __init__(self, symbol: str = "btcusdt"):
         self.symbol = symbol.lower()
-        # Using bookTicker for lowest latency L1 best bid/ask updates. 
-        # Alternatively we can use @trade or @aggTrade for executed price.
-        self.ws_url = f"wss://stream.binance.com:9443/ws/{self.symbol}@bookTicker"
+        # Using bookTicker for lowest latency L1 best bid/ask updates from Binance US. 
+        self.ws_url = f"wss://stream.binance.us:9443/ws/{self.symbol}@bookTicker"
         self.on_price_update: Optional[Callable[[float, float, float], None]] = None
         
     async def connect(self):
@@ -24,13 +23,12 @@ class BinanceWSClient:
                         if isinstance(message, str):
                             data = json.loads(message)
                             if "b" in data and "a" in data:
-                                bid = float(data["b"])
-                                ask = float(data["a"])
-                                mid = (bid + ask) / 2.0
+                                top_bid = float(data["b"])
+                                top_ask = float(data.get('a'))
+                                mid = (top_bid + top_ask) / 2
                                 if self.on_price_update:
-                                    # Need a sync wrapper or if on_price_update is async, await it.
+                                    self.on_price_update(mid, top_bid, top_ask)                                  # Need a sync wrapper or if on_price_update is async, await it.
                                     # Assuming synchronous callback for maximum performance to just update a shared state dict.
-                                    self.on_price_update(mid, bid, ask)
             except websockets.exceptions.ConnectionClosed:
                 logger.warning("Binance WS closed. Reconnecting in 2 seconds...")
                 await asyncio.sleep(2)

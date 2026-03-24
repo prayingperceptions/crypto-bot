@@ -1,7 +1,8 @@
 import asyncio
 import time
+from dotenv import load_dotenv
+from core.logger import setup_logger
 from core.binance_ws import BinanceWSClient
-from core.binance_rest import BinanceFuturesClient
 from core.kalshi_client import KalshiClient
 from core.kalshi_l2 import OrderBookStore
 from core.black_scholes import calculate_probability_above_strike
@@ -23,9 +24,9 @@ TRADE_FRACTION = 0.10 # Max 10% of base per trade ($5.00)
 class HftEngine:
     def __init__(self):
         self.binance_ws = BinanceWSClient(symbol=BINANCE_SYMBOL)
-        self.binance_rest = BinanceFuturesClient(testnet=True)
         self.kalshi = KalshiClient(is_demo=True)
         self.l2_store = OrderBookStore()
+        self.last_fair_value = 0
         
         # Risk State
         self.deployed_capital = 0.0
@@ -53,22 +54,19 @@ class HftEngine:
         delta = self.calculate_delta(binance_price)
         fair_value_cents = int(delta * 100)
         
-        # STOP LOSS: If the fair value drops below say 10 cents, or we lose 20 cents of edge
+        # STOP LOSS: If we accumulated inventory from our passive Maker orders, but the 
+        # fair value suddenly drops, we need to market-sell to dump our 'YES' bag before it hits 0.
         if fair_value_cents < 15 or k_bid < 10:
-            logger.warning(f"🚨 [STOP LOSS] Derisking {self.active_positions} contracts! Fair Value dropping: {fair_value_cents}c | Bid: {k_bid}c")
+            logger.warning(f"🚨 [STOP LOSS] Derisking {self.active_positions} maker contracts! Fair Value: {fair_value_cents}c")
             
             qty_to_sell = min(self.active_positions, k_bid_qty)
             if qty_to_sell > 0:
                 client_id = f"sl_{int(time.time())}"
-                asyncio.create_task(self.kalshi.place_order(TARGET_KALSHI_MARKET, "sell", qty_to_sell, k_bid, client_id))
-                
-                # Unwind the Binance short hedge (market BUY to close short)
-                hedge_relieve_qty = self.calculate_delta(binance_price) * qty_to_sell
-                asyncio.create_task(self.binance_rest.place_futures_order(BINANCE_SYMBOL, "BUY", hedge_relieve_qty))
+                # Dump at whatever the current best bid is (market sweep)
+                asyncio.create_task(self.kalshi.place_order(TARGET_KALSHI_MARKET, "sell", qty_to_sell, k_bid, client_id, order_type="market"))
                 
                 self.active_positions -= qty_to_sell
-                # self.deployed_capital is roughly adjusted, though in production you'd track exact fill prices via SQLite
-                self.deployed_capital -= (qty_to_sell * 0.10) # rough estimate of recovered capital
+                self.deployed_capital -= (qty_to_sell * 0.10) 
                 time.sleep(1)
                 
     async def reconcile_positions(self):
@@ -99,44 +97,33 @@ class HftEngine:
         return float(norm.cdf(d1))
 
     def evaluate_trade_trigger(self, binance_price: float, k_bid: int, k_bid_qty: int, k_ask: int, k_ask_qty: int):
-        # 1. Circuit Breaker: Capital bounds
-        target_trade_usd = MAX_CAPITAL_RISK_USD * TRADE_FRACTION
-        
-        # 2. Delta & Fair Value calculation
+        # 1. Delta & Fair Value calculation from Binance US Spot
         delta = self.calculate_delta(binance_price)
         fair_value_cents = int(delta * 100)
         
-        # 3. Execution Edge condition
-        if k_ask > 0 and (fair_value_cents - k_ask) >= 5: # 5 cent edge
-            # How many contracts can we afford with our trade fraction?
-            max_contracts = int((target_trade_usd * 100) / k_ask)
-            desired_qty = min(max_contracts, k_ask_qty)
+        # 2. Define Market Maker Spread (e.g., 2 cents wide on each side)
+        my_bid = max(1, fair_value_cents - 2)
+        my_ask = min(99, fair_value_cents + 2)
+        
+        # 3. To avoid getting rate-limited by posting orders every 100ms on every tiny flutter, 
+        # we only re-post our limit orders if the underlying Fair Value shifts by at least 1 full cent.
+        if abs(fair_value_cents - getattr(self, 'last_fair_value', 0)) >= 1:
+            logger.info(f"🔄 [MARKET MAKER] BTC: {binance_price:.2f} | Fair Value: {fair_value_cents}c -> Posting BID: {my_bid}c | ASK: {my_ask}c")
+            self.last_fair_value = fair_value_cents
             
-            # Risk Gate
-            if self.deployed_capital + (desired_qty * k_ask / 100.0) > MAX_CAPITAL_RISK_USD:
-                logger.debug("Risk Limit Hit. Skipping edge.")
-                return
-                
-            # Slippage Gate
-            if not self.validate_l2_slippage(TARGET_KALSHI_MARKET, "buy", desired_qty, k_ask + MAX_SLIPPAGE_CENTS):
-                logger.debug("L2 Book too thin for desired qty. Skipping to avoid slippage.")
-                return
-                
-            hedge_btc_qty = delta * desired_qty  # Approximate hedge ratio
+            # In production, you would fetch and cancel your outstanding open Kalshi orders here first
+            # using self.kalshi.cancel_order(...) before posting the new ones.
             
-            logger.info(f"⚡ [TRIGGER] Executing Arb: Buy {desired_qty} YES @ {k_ask}c | Shorting {hedge_btc_qty:.5f} BTC via Futures")
+            # We deploy 10% of max capital ($5) into each side of the book as liquidity.
+            target_trade_usd = MAX_CAPITAL_RISK_USD * TRADE_FRACTION
+            max_contracts_bid = int((target_trade_usd * 100) / my_bid)
+            max_contracts_ask = int((target_trade_usd * 100) / my_ask)
             
-            # Dispatch Async
-            client_id = f"arb_{int(time.time())}"
-            asyncio.create_task(self.kalshi.place_order(TARGET_KALSHI_MARKET, "buy", desired_qty, k_ask, client_id))
-            asyncio.create_task(self.binance_rest.place_futures_order(BINANCE_SYMBOL, "SELL", hedge_btc_qty))
+            client_id_buy = f"mm_buy_{int(time.time())}"
+            client_id_sell = f"mm_sell_{int(time.time())}"
             
-            # Update state
-            self.deployed_capital += (desired_qty * k_ask / 100.0)
-            self.active_positions += desired_qty
-            
-            # Wait briefly to avoid duplicate fires instantly
-            time.sleep(1)
+            asyncio.create_task(self.kalshi.place_order(TARGET_KALSHI_MARKET, "buy", max_contracts_bid, my_bid, client_id_buy, order_type="limit"))
+            asyncio.create_task(self.kalshi.place_order(TARGET_KALSHI_MARKET, "sell", max_contracts_ask, my_ask, client_id_sell, order_type="limit"))
 
     async def heartbeat_loop(self):
         """Send a telegram heartbeat verifying the container is healthy every 6 hours."""

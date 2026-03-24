@@ -24,7 +24,7 @@ TRADE_FRACTION = 0.10 # Max 10% of base per trade ($5.00)
 class HftEngine:
     def __init__(self):
         self.binance_ws = BinanceWSClient(symbol=BINANCE_SYMBOL)
-        self.kalshi = KalshiClient(is_demo=True)
+        self.kalshi = KalshiClient(is_demo=False)
         self.l2_store = OrderBookStore()
         self.last_fair_value = 0
         

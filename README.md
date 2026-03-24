@@ -2,8 +2,6 @@
 
 An asynchronous, low-latency cryptocurrency prediction market trading bot specifically built for [Kalshi](https://kalshi.com). 
 
-This bot was originally designed to Delta hedge across Kalshi and Binance Futures. However, to comply with US exchanges (Binance.US) which do not support perpetual futures, **the bot has been pivoted to Option A (Pure Market Making)**.
-
 It rapidly fetches sub-100ms Spot L1 data from Binance.US, feeds it through a customized Black-Scholes probability model to determine the exact 'Fair Value' of a Kalshi contract, and autonomously posts optimized BID and ASK limit orders on Kalshi to farm the spread.
 
 ## Core Architecture

@@ -40,3 +40,5 @@ docker-compose up -d --build
 
 ## Disclaimer
 This is automated trading software. Prediction markets and cryptocurrency are highly volatile. Never run this with more capital than you are willing to lose.
+
+All glory to Jesus 

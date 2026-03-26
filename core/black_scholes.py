@@ -36,3 +36,31 @@ def calculate_probability_above_strike(
     probability = float(norm.cdf(d2))
     
     return probability
+
+
+def calculate_probability_in_range(
+    current_price: float, 
+    floor_strike: float,
+    cap_strike: float,
+    days_to_expiry: float, 
+    implied_vol_annual: float, 
+    risk_free_rate: float = 0.05
+) -> float:
+    """
+    Calculate the probability that price finishes between floor_strike and cap_strike.
+    Used for Kalshi bracket/range markets (-B tickers).
+    
+    P(floor < S < cap) = P(S > floor) - P(S > cap)
+    """
+    if floor_strike >= cap_strike:
+        return 0.0
+    
+    p_above_floor = calculate_probability_above_strike(
+        current_price, floor_strike, days_to_expiry, implied_vol_annual, risk_free_rate
+    )
+    p_above_cap = calculate_probability_above_strike(
+        current_price, cap_strike, days_to_expiry, implied_vol_annual, risk_free_rate
+    )
+    
+    return max(0.0, p_above_floor - p_above_cap)
+

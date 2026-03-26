@@ -32,15 +32,30 @@ async def send_telegram_message(message: str) -> bool:
     except Exception as e:
         logger.error(f"Error sending telegram message: {e}")
         return False
-    return False
 
-async def send_telegram_heartbeat():
-    """Send a basic ping to prove the bot is alive."""
-    await send_telegram_message("<b>🤖 Crypto-Bot Heartbeat</b>\nSystem is online and actively scanning L2 Books.")
+async def send_telegram_heartbeat(target_market: str = "", fair_value: int = 0):
+    """Send a heartbeat with current target market info."""
+    market_info = ""
+    if target_market:
+        market_info = f"\n🎯 <b>Target:</b> {target_market}\n💰 <b>Fair Value:</b> {fair_value}c"
+    await send_telegram_message(
+        f"<b>🤖 Crypto-Bot Heartbeat</b>\n"
+        f"System is online and actively scanning L2 Books."
+        f"{market_info}"
+    )
 
 async def send_telegram_pnl(active_exposure: float, daily_pnl: float):
     """Daily push notification for capital status."""
     msg = (f"<b>📊 Daily Bot Metrics</b>\n"
            f"💵 <b>Current Exposure:</b> ${active_exposure:.2f}\n"
            f"📈 <b>Est. Daily PnL:</b> ${daily_pnl:.2f}")
+    await send_telegram_message(msg)
+
+async def send_telegram_market_switch(ticker: str, strike: float, days_to_expiry: float, fair_value: int):
+    """Notify when the bot switches to a new market contract."""
+    msg = (f"<b>🔄 Market Switch</b>\n"
+           f"🎯 <b>New Target:</b> {ticker}\n"
+           f"💲 <b>Strike:</b> ${strike:,.0f}\n"
+           f"⏰ <b>Expires in:</b> {days_to_expiry:.1f} days\n"
+           f"💰 <b>Fair Value:</b> {fair_value}c")
     await send_telegram_message(msg)

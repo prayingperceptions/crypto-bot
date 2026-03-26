@@ -30,6 +30,7 @@ class KalshiClient:
             self.private_key = self._load_private_key(str(private_key_input))
             
         self.session: Optional[aiohttp.ClientSession] = None
+        self._ws = None  # Set by connect_ws(), used by switch_market()
         
     def _load_private_key(self, key_input: str):
         try:

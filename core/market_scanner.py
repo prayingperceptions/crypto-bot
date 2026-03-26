@@ -82,36 +82,24 @@ class MarketScanner:
             logger.error(f"Failed to discover events: {e}")
             return []
 
-    async def select_best_market(self, spot_price: float, iv: float = 50.0, 
-                                  series_ticker: str = "KXBTCD") -> Optional[Dict[str, Any]]:
-        """
-        Find the best market to trade by:
-        1. Scanning live events for the given series
-        2. Fetching all tail markets within each event
-        3. Picking the tail with fair value closest to 50c AND sufficient open interest
-        
-        Returns dict with: ticker, strike, close_time, days_to_expiry, expiry_dt,
-        fair_value_cents, open_interest, binance_symbol
-        """
+    async def _collect_candidates(self, spot_price: float, iv: float, 
+                                    series_ticker: str, max_events: int = 5) -> List[Dict[str, Any]]:
+        """Collect all tradeable tail market candidates across live events."""
         series_info = CRYPTO_SERIES.get(series_ticker, {"name": series_ticker, "binance_symbol": "BTCUSDT"})
         
         live_events = await self.discover_live_events(series_ticker)
         if not live_events:
-            logger.warning(f"No live events found for {series_ticker}.")
-            return None
+            return []
 
         now = datetime.now(timezone.utc)
         candidates = []
 
-        # Check the first 5 soonest events (more events = more chances)
-        for event in live_events[:5]:
+        for event in live_events[:max_events]:
             event_ticker = event.get("event_ticker", "")
             markets = await self._fetch_event_markets(event_ticker)
             
             for market in markets:
                 ticker = market.get("ticker", "")
-                
-                # Only tail markets (-T) with floor_strike
                 if "-T" not in ticker:
                     continue
                     
@@ -122,15 +110,11 @@ class MarketScanner:
                 if strike <= 0:
                     continue
                 
-                # Accept any status (active, initialized, open)
                 status = market.get("status", "")
-                
-                # Open interest filter (0 OI = no liquidity at all)
                 oi = float(market.get("open_interest_fp", "0") or "0")
                 if oi < MIN_OPEN_INTEREST:
                     continue
                 
-                # Parse close_time for expiry
                 close_time_str = market.get("close_time") or market.get("expected_expiration_time")
                 days_to_expiry = 0.0
                 expiry_dt = None
@@ -142,21 +126,17 @@ class MarketScanner:
                     except Exception:
                         pass
                 
-                if days_to_expiry < (0.5 / 24.0):  # Skip if < 30 min to expiry
+                if days_to_expiry < (0.5 / 24.0):
                     continue
                 
-                # Fair value from Black-Scholes
                 fair_value = calculate_probability_above_strike(spot_price, strike, days_to_expiry, iv)
                 fv_cents = int(fair_value * 100)
                 
-                # Only consider markets with tradeable fair value (5-95c)
                 if fv_cents < 5 or fv_cents > 95:
                     continue
                 
-                # Bid/ask from API (for reference)
                 yes_bid = float(market.get("previous_yes_bid_dollars", "0") or "0")
                 yes_ask = float(market.get("previous_yes_ask_dollars", "0") or "0")
-                
                 distance_from_50 = abs(fv_cents - 50)
                 
                 candidates.append({
@@ -177,27 +157,62 @@ class MarketScanner:
                     "crypto_name": series_info["name"],
                 })
 
+        return candidates
+
+    async def select_best_market(self, spot_price: float, iv: float = 50.0, 
+                                  series_ticker: str = "KXBTCD") -> Optional[Dict[str, Any]]:
+        """Find the single best market (closest to 50c fair value)."""
+        candidates = await self._collect_candidates(spot_price, iv, series_ticker)
         if not candidates:
-            logger.warning(f"No tradeable {series_ticker} tail markets found with OI >= {MIN_OPEN_INTEREST}.")
+            logger.warning(f"No tradeable {series_ticker} tail markets found.")
             return None
 
-        # Sort by: closest to 50c fair value, then highest OI
         candidates.sort(key=lambda c: (c["distance_from_50"], -c["open_interest"]))
-        
         best = candidates[0]
         logger.info(
             f"✅ Selected: {best['ticker']} | above ${best['strike']:,.0f} | "
             f"FV: {best['fair_value_cents']}c | OI: {best['open_interest']:,.0f} | "
-            f"Exp: {best['days_to_expiry']*24:.1f}h | Bid: {best['yes_bid']*100:.0f}c Ask: {best['yes_ask']*100:.0f}c"
+            f"Exp: {best['days_to_expiry']*24:.1f}h"
         )
+        return best
+
+    async def select_top_n_markets(self, spot_price: float, iv: float = 50.0,
+                                    series_ticker: str = "KXBTCD", 
+                                    n: int = 3) -> List[Dict[str, Any]]:
+        """
+        Select the best market from each of the N nearest events.
+        This gives us uncorrelated fill opportunities across different expiries.
+        """
+        candidates = await self._collect_candidates(spot_price, iv, series_ticker, max_events=n + 2)
+        if not candidates:
+            logger.warning(f"No tradeable {series_ticker} tail markets found.")
+            return []
+
+        # Group candidates by event_ticker
+        by_event: Dict[str, List[Dict[str, Any]]] = {}
+        for c in candidates:
+            evt = c["event_ticker"]
+            by_event.setdefault(evt, []).append(c)
         
-        for i, c in enumerate(candidates[:5]):
-            logger.debug(
-                f"  #{i+1}: {c['ticker']} fv={c['fair_value_cents']}c "
-                f"oi={c['open_interest']:,.0f} exp={c['days_to_expiry']*24:.1f}h"
+        # From each event, pick the market closest to 50c
+        selected = []
+        for evt, markets in by_event.items():
+            markets.sort(key=lambda c: (c["distance_from_50"], -c["open_interest"]))
+            selected.append(markets[0])
+        
+        # Sort selected by soonest expiry first, take top N
+        selected.sort(key=lambda c: c["days_to_expiry"])
+        top_n = selected[:n]
+        
+        for i, m in enumerate(top_n):
+            logger.info(
+                f"✅ Market #{i+1}: {m['ticker']} | above ${m['strike']:,.0f} | "
+                f"FV: {m['fair_value_cents']}c | OI: {m['open_interest']:,.0f} | "
+                f"Exp: {m['days_to_expiry']*24:.1f}h"
             )
         
-        return best
+        return top_n
 
     async def close(self):
         await self.kalshi.close()
+

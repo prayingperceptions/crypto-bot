@@ -33,15 +33,12 @@ async def send_telegram_message(message: str) -> bool:
         logger.error(f"Error sending telegram message: {e}")
         return False
 
-async def send_telegram_heartbeat(target_market: str = "", fair_value: int = 0):
-    """Send a heartbeat with current target market info."""
-    market_info = ""
-    if target_market:
-        market_info = f"\n🎯 <b>Target:</b> {target_market}\n💰 <b>Fair Value:</b> {fair_value}c"
+async def send_telegram_heartbeat(markets_summary: str = "", num_markets: int = 0):
+    """Send heartbeat showing all active markets."""
     await send_telegram_message(
         f"<b>🤖 Crypto-Bot Heartbeat</b>\n"
-        f"System is online and actively scanning L2 Books."
-        f"{market_info}"
+        f"System is online, trading {num_markets} market(s).\n"
+        f"📊 <b>Active:</b> {markets_summary}"
     )
 
 async def send_telegram_pnl(active_exposure: float, daily_pnl: float):
@@ -51,13 +48,12 @@ async def send_telegram_pnl(active_exposure: float, daily_pnl: float):
            f"📈 <b>Est. Daily PnL:</b> ${daily_pnl:.2f}")
     await send_telegram_message(msg)
 
-async def send_telegram_market_switch(ticker: str, strike: float, days_to_expiry: float, fair_value: int):
-    """Notify when the bot switches to a new market contract."""
+async def send_telegram_market_switch(markets_info: str, strike: float, days_to_expiry: float, fair_value: int):
+    """Notify when markets are updated."""
     hours = days_to_expiry * 24
     expiry_str = f"{hours:.1f}h" if hours < 24 else f"{days_to_expiry:.1f}d"
-    msg = (f"<b>🔄 Market Switch</b>\n"
-           f"🎯 <b>New Target:</b> {ticker}\n"
-           f"💲 <b>Strike:</b> ${strike:,.0f}\n"
-           f"⏰ <b>Expires in:</b> {expiry_str}\n"
-           f"💰 <b>Fair Value:</b> {fair_value}c")
+    msg = (f"<b>🔄 Markets Updated</b>\n"
+           f"🎯 <b>Active:</b> {markets_info}\n"
+           f"⏰ <b>Nearest Expiry:</b> {expiry_str}\n"
+           f"💰 <b>Lead FV:</b> {fair_value}c")
     await send_telegram_message(msg)

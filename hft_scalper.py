@@ -16,7 +16,7 @@ logger = setup_logger("hft_scalper")
 MAX_CAPITAL_RISK_USD = 50.0  # Max exposure $50
 MAX_SLIPPAGE_CENTS = 2  # Max slippage tolerance
 TRADE_FRACTION = 0.10  # Max 10% of base per trade ($5.00)
-MARKET_RESCAN_INTERVAL = 3600  # Re-scan for better markets every hour
+MARKET_RESCAN_INTERVAL = 900  # Re-scan every 15 min (events are hourly)
 
 class HftEngine:
     def __init__(self):
@@ -164,6 +164,8 @@ class HftEngine:
         )
         
         if old_market != self.target_market:
+            # Resubscribe Kalshi WS to new market's L2 book
+            await self.kalshi.switch_market(old_market, self.target_market)
             await send_telegram_market_switch(self.target_market, self.target_strike, best["days_to_expiry"], fair_val)
         
         return True

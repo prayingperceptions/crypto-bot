@@ -149,59 +149,109 @@ class KalshiClient:
         return await self._request("POST", path, json=payload)
 
     async def connect_ws(self, market_tickers: List[str], l2_store: Any):
-        """Connect to the generic Kalshi WebSocket (Phase 2)."""
-        logger.info(f"Connecting to Kalshi WebSocket at {self.ws_url}")
+        """Connect to Kalshi WebSocket with auto-reconnect. Stores ws for resubscription."""
+        self._ws = None
+        self._l2_store = l2_store
+        self._ws_sub_id = 2
+        
+        while True:
+            try:
+                logger.info(f"Connecting to Kalshi WebSocket at {self.ws_url}")
+                async with websockets.connect(self.ws_url) as ws:
+                    self._ws = ws
+                    
+                    # Authenticate
+                    current_time_milliseconds = int(time.time() * 1000)
+                    sig = self._generate_signature(current_time_milliseconds, "GET", "/trade-api/ws/v2")
+                    
+                    auth_msg = {
+                        "id": 1,
+                        "cmd": "subscribe",
+                        "params": {
+                            "channels": ["auth"],
+                            "kalshi-access-key": self.api_key or "",
+                            "kalshi-access-signature": sig,
+                            "kalshi-access-timestamp": current_time_milliseconds
+                        }
+                    }
+                    await ws.send(json.dumps(auth_msg))
+                    
+                    # Subscribe to initial markets
+                    await self._send_subscribe(ws, market_tickers)
+                    
+                    # Process messages
+                    async for message in ws:
+                        if isinstance(message, str):
+                            data = json.loads(message)
+                            msg_type = data.get("type")
+                            msg_data = data.get("msg", {})
+                            
+                            if msg_type == "orderbook_snapshot":
+                                ticker = msg_data.get("market_ticker")
+                                bids = msg_data.get("bids", [])
+                                asks = msg_data.get("asks", [])
+                                if ticker:
+                                    l2_store.process_snapshot(ticker, bids, asks)
+                                    
+                            elif msg_type == "orderbook_delta":
+                                ticker = msg_data.get("market_ticker")
+                                bids = msg_data.get("bids", [])
+                                asks = msg_data.get("asks", [])
+                                if ticker:
+                                    l2_store.process_delta(ticker, bids, asks)
+                                    
+            except websockets.exceptions.ConnectionClosed:
+                logger.warning("Kalshi WS closed. Reconnecting in 5 seconds...")
+                self._ws = None
+                await asyncio.sleep(5)
+            except Exception as e:
+                logger.error(f"Kalshi WS Error: {e}. Reconnecting in 5 seconds...")
+                self._ws = None
+                await asyncio.sleep(5)
+
+    async def _send_subscribe(self, ws, market_tickers: List[str]):
+        """Send orderbook subscription for given tickers."""
+        self._ws_sub_id += 1
+        sub_msg = {
+            "id": self._ws_sub_id,
+            "cmd": "subscribe",
+            "params": {
+                "channels": ["orderbook_delta"],
+                "market_tickers": market_tickers
+            }
+        }
+        await ws.send(json.dumps(sub_msg))
+        logger.info(f"Subscribed to L2 for: {market_tickers}")
+
+    async def _send_unsubscribe(self, ws, market_tickers: List[str]):
+        """Unsubscribe from orderbook for given tickers."""
+        self._ws_sub_id += 1
+        unsub_msg = {
+            "id": self._ws_sub_id,
+            "cmd": "unsubscribe",
+            "params": {
+                "channels": ["orderbook_delta"],
+                "market_tickers": market_tickers
+            }
+        }
+        await ws.send(json.dumps(unsub_msg))
+        logger.info(f"Unsubscribed from L2 for: {market_tickers}")
+
+    async def switch_market(self, old_ticker: str, new_ticker: str):
+        """Switch L2 subscription from old market to new market on the live WS."""
+        ws = self._ws
+        if not ws:
+            logger.warning("Cannot switch market — WS not connected. Will subscribe on reconnect.")
+            return
         try:
-            async with websockets.connect(self.ws_url) as ws:
-                current_time_milliseconds = int(time.time() * 1000)
-                sig = self._generate_signature(current_time_milliseconds, "GET", "/trade-api/ws/v2")
-                
-                auth_msg = {
-                    "id": 1,
-                    "cmd": "subscribe",
-                    "params": {
-                        "channels": ["auth"],
-                        "kalshi-access-key": self.api_key or "",
-                        "kalshi-access-signature": sig,
-                        "kalshi-access-timestamp": current_time_milliseconds
-                    }
-                }
-                await ws.send(json.dumps(auth_msg))
-                
-                sub_msg = {
-                    "id": 2,
-                    "cmd": "subscribe",
-                    "params": {
-                        "channels": ["orderbook_delta"],
-                        "market_tickers": market_tickers
-                    }
-                }
-                await ws.send(json.dumps(sub_msg))
-                
-                async for message in ws:
-                    if isinstance(message, str):
-                        data = json.loads(message)
-                        msg_type = data.get("type")
-                        msg_data = data.get("msg", {})
-                        
-                        if msg_type == "orderbook_snapshot":
-                            ticker = msg_data.get("market_ticker")
-                            bids = msg_data.get("bids", [])
-                            asks = msg_data.get("asks", [])
-                            if ticker:
-                                l2_store.process_snapshot(ticker, bids, asks)
-                                
-                        elif msg_type == "orderbook_delta":
-                            ticker = msg_data.get("market_ticker")
-                            bids = msg_data.get("bids", [])
-                            asks = msg_data.get("asks", [])
-                            if ticker:
-                                l2_store.process_delta(ticker, bids, asks)
-                                
+            if old_ticker:
+                await self._send_unsubscribe(ws, [old_ticker])
+            await self._send_subscribe(ws, [new_ticker])
         except Exception as e:
-            logger.error(f"WebSocket error: {e}")
+            logger.error(f"Failed to switch market subscription: {e}")
 
     async def close(self):
         session = self.session
         if session:
             await session.close()
+

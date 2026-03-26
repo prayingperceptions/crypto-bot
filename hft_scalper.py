@@ -155,6 +155,7 @@ class HftEngine:
             self._init_binance_ws(binance_symbol)
         
         fair_val = best.get("fair_value_cents", 0)
+        self.last_fair_value = fair_val  # Cache for heartbeat before first Binance tick
         oi = best.get("open_interest", 0)
         logger.info(
             f"✅ Engine: {self.target_market} | above ${self.target_strike:,.0f} | "

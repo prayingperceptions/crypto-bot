@@ -53,9 +53,11 @@ async def send_telegram_pnl(active_exposure: float, daily_pnl: float):
 
 async def send_telegram_market_switch(ticker: str, strike: float, days_to_expiry: float, fair_value: int):
     """Notify when the bot switches to a new market contract."""
+    hours = days_to_expiry * 24
+    expiry_str = f"{hours:.1f}h" if hours < 24 else f"{days_to_expiry:.1f}d"
     msg = (f"<b>🔄 Market Switch</b>\n"
            f"🎯 <b>New Target:</b> {ticker}\n"
            f"💲 <b>Strike:</b> ${strike:,.0f}\n"
-           f"⏰ <b>Expires in:</b> {days_to_expiry:.1f} days\n"
+           f"⏰ <b>Expires in:</b> {expiry_str}\n"
            f"💰 <b>Fair Value:</b> {fair_value}c")
     await send_telegram_message(msg)

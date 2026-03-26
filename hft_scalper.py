@@ -12,22 +12,34 @@ from core.deribit import get_btc_dvol, get_btc_price
 
 logger = setup_logger("hft_scalper")
 
-# Production Params 
-MAX_SLIPPAGE_CENTS = 2  # Max slippage tolerance
-TRADE_FRACTION = 0.10  # Max 10% of balance per trade per market
-NUM_MARKETS = 3  # Trade across 3 simultaneous events
-MARKET_RESCAN_INTERVAL = 900  # Re-scan every 15 min
+# ─── Capital Tier System ────────────────────────────────────────────
+# The bot auto-scales based on portfolio balance.
+# More capital = more markets + cryptos = more fill opportunities.
+CAPITAL_TIERS = [
+    # (min_balance, max_markets, crypto_series_to_scan)
+    (0,    1, ["KXBTCD"]),                                              # $0-99:    1 BTC market
+    (100,  3, ["KXBTCD", "KXETHD"]),                                    # $100-499: 3 markets, BTC+ETH
+    (500,  5, ["KXBTCD", "KXETHD", "KXSOLD", "KXXRP"]),                # $500-2499: 5 markets, 4 cryptos
+    (2500, 8, ["KXBTCD", "KXETHD", "KXSOLD", "KXXRP", "KXBNB", "KXHYPE"]),  # $2500+: 8 markets, all cryptos
+]
+
+MAX_SLIPPAGE_CENTS = 2
+TRADE_FRACTION = 0.10  # 10% of balance per trade per market
+MARKET_RESCAN_INTERVAL = 900  # 15 min
 
 class ActiveMarket:
-    """Tracks state for one active market the engine is trading on."""
+    """Tracks state for one market the engine is trading on."""
     def __init__(self, ticker: str, strike: float, expiry_dt: datetime | None,
-                 fair_value_cents: int = 0, event_ticker: str = ""):
+                 fair_value_cents: int = 0, event_ticker: str = "",
+                 binance_symbol: str = "BTCUSDT", crypto_name: str = "BTC"):
         self.ticker = ticker
         self.strike = strike
         self.expiry_dt = expiry_dt
         self.event_ticker = event_ticker
         self.last_fair_value = fair_value_cents
         self.active_positions = 0
+        self.binance_symbol = binance_symbol
+        self.crypto_name = crypto_name
     
     def get_days_to_expiry(self) -> float:
         if not self.expiry_dt:
@@ -40,9 +52,11 @@ class HftEngine:
         self.kalshi = KalshiClient(is_demo=False)
         self.scanner = MarketScanner(kalshi_client=self.kalshi)
         self.l2_store = OrderBookStore()
-        self.binance_ws: BinanceWSClient | None = None
         
-        # Multiple active markets (one per event/expiry)
+        # Per-crypto Binance WS feeds (keyed by symbol like "BTCUSDT")
+        self.binance_feeds: dict[str, BinanceWSClient] = {}
+        
+        # Active markets (multiple, across different events/cryptos)
         self.markets: list[ActiveMarket] = []
         
         # Shared state
@@ -50,15 +64,33 @@ class HftEngine:
         self.max_capital: float = 0.0
         self.deployed_capital = 0.0
         
-    def _init_binance_ws(self, symbol: str):
-        """Initialize Binance WS for a given crypto symbol."""
-        self.binance_ws = BinanceWSClient(symbol=symbol)
-        self.binance_ws.on_price_update = self.on_binance_price
-        
-    def on_binance_price(self, mid: float, bid: float, ask: float):
-        """Called on every Binance L1 update. Evaluates ALL active markets."""
+        # Current tier settings
+        self.tier_max_markets: int = 1
+        self.tier_series: list[str] = ["KXBTCD"]
+
+    def _get_tier(self) -> tuple[int, list[str]]:
+        """Determine current capital tier based on portfolio balance."""
+        max_markets = 1
+        series = ["KXBTCD"]
+        for min_bal, markets, cryptos in CAPITAL_TIERS:
+            if self.max_capital >= min_bal:
+                max_markets = markets
+                series = cryptos
+        return max_markets, series
+
+    def _get_binance_ws(self, symbol: str) -> BinanceWSClient:
+        """Get or create Binance WS for a given symbol."""
+        key = symbol.lower()
+        if key not in self.binance_feeds:
+            ws = BinanceWSClient(symbol=symbol)
+            ws.on_price_update = lambda mid, bid, ask, sym=key: self._on_price(sym, mid, bid, ask)
+            self.binance_feeds[key] = ws
+        return self.binance_feeds[key]
+
+    def _on_price(self, symbol: str, mid: float, bid: float, ask: float):
+        """Called on every Binance tick. Evaluates markets for this crypto."""
         for market in self.markets:
-            if not market.ticker:
+            if market.binance_symbol.lower() != symbol:
                 continue
             k_bid, k_bid_qty, k_ask, k_ask_qty = self.l2_store.get_top_of_book(market.ticker)
             self.evaluate_trade_trigger(market, mid, k_bid, k_bid_qty, k_ask, k_ask_qty)
@@ -67,25 +99,21 @@ class HftEngine:
     def evaluate_exit_trigger(self, market: ActiveMarket, binance_price: float, k_bid: int, k_bid_qty: int):
         if market.active_positions <= 0:
             return
-            
         fair_value_cents = self._compute_fair_value_cents(market, binance_price)
         if fair_value_cents is None:
             return
-        
         if fair_value_cents < 15 or k_bid < 10:
-            logger.warning(f"🚨 [STOP LOSS] {market.ticker} | Derisking {market.active_positions} contracts! FV: {fair_value_cents}c")
-            
+            logger.warning(f"🚨 [STOP LOSS] {market.ticker} | FV: {fair_value_cents}c")
             qty_to_sell = min(market.active_positions, k_bid_qty)
             if qty_to_sell > 0:
                 client_id = f"sl_{market.ticker[-8:]}_{int(time.time())}"
                 asyncio.create_task(self.kalshi.place_order(market.ticker, "sell", qty_to_sell, k_bid, client_id, order_type="market"))
                 market.active_positions -= qty_to_sell
-                self.deployed_capital -= (qty_to_sell * 0.10) 
                 time.sleep(1)
                 
     async def reconcile_positions(self):
         """Fetch currently open positions on boot."""
-        logger.info("Reconciling active positions against Kalshi...")
+        logger.info("Reconciling positions...")
         resp = await self.kalshi.get_positions()
         if "positions" in resp:
             for position in resp["positions"]:
@@ -93,10 +121,9 @@ class HftEngine:
                     if position.get("ticker") == market.ticker:
                         market.active_positions = position.get("position", 0)
         total = sum(m.active_positions for m in self.markets)
-        logger.info(f"Reconciliation Complete. Total active positions across {len(self.markets)} markets: {total}")
+        logger.info(f"Reconciled: {total} positions across {len(self.markets)} markets")
         
     def _compute_fair_value_cents(self, market: ActiveMarket, spot: float) -> int | None:
-        """Calculate fair value in cents using Black-Scholes."""
         days = market.get_days_to_expiry()
         if days <= 0 or market.strike <= 0:
             return None
@@ -104,7 +131,7 @@ class HftEngine:
         return int(prob * 100)
 
     async def fetch_balance(self):
-        """Fetch live portfolio balance from Kalshi."""
+        """Fetch live portfolio balance from Kalshi and update tier."""
         try:
             resp = await self.kalshi.get_balance()
             balance = float(resp.get("balance", 0))
@@ -112,9 +139,19 @@ class HftEngine:
                 balance = balance / 100.0
             if balance > 0:
                 self.max_capital = balance
-                logger.info(f"💰 Portfolio balance: ${self.max_capital:.2f}")
+                
+                # Update tier
+                old_tier = (self.tier_max_markets, self.tier_series)
+                self.tier_max_markets, self.tier_series = self._get_tier()
+                new_tier = (self.tier_max_markets, self.tier_series)
+                
+                cryptos_str = ", ".join(self.tier_series)
+                logger.info(f"💰 Balance: ${self.max_capital:.2f} | Tier: {self.tier_max_markets} markets, [{cryptos_str}]")
+                
+                if new_tier != old_tier and old_tier[0] > 0:
+                    logger.info(f"📈 TIER UPGRADE! Now trading {self.tier_max_markets} markets across {len(self.tier_series)} cryptos")
             else:
-                logger.warning(f"Could not fetch balance, using current: ${self.max_capital:.2f}")
+                logger.warning(f"Balance unavailable, using: ${self.max_capital:.2f}")
         except Exception as e:
             logger.error(f"Balance fetch failed: {e}")
 
@@ -130,12 +167,11 @@ class HftEngine:
         if abs(fair_value_cents - market.last_fair_value) >= 1:
             hours_left = market.get_days_to_expiry() * 24
             logger.info(
-                f"🔄 [{market.ticker}] Spot: {binance_price:.2f} | FV: {fair_value_cents}c | "
-                f"IV: {self.iv:.0f}% | Exp: {hours_left:.1f}h -> BID: {my_bid}c | ASK: {my_ask}c"
+                f"🔄 [{market.crypto_name}] {market.ticker} | FV: {fair_value_cents}c | "
+                f"Exp: {hours_left:.1f}h -> BID: {my_bid}c | ASK: {my_ask}c"
             )
             market.last_fair_value = fair_value_cents
             
-            # Capital per market = total balance / number of active markets
             capital_per_market = self.max_capital / max(len(self.markets), 1)
             target_trade_usd = capital_per_market * TRADE_FRACTION
             if target_trade_usd <= 0:
@@ -144,6 +180,9 @@ class HftEngine:
             max_contracts_bid = int((target_trade_usd * 100) / my_bid) if my_bid > 0 else 0
             max_contracts_ask = int((target_trade_usd * 100) / my_ask) if my_ask > 0 else 0
             
+            if max_contracts_bid <= 0 and max_contracts_ask <= 0:
+                return
+            
             client_id_buy = f"mm_b_{market.ticker[-8:]}_{int(time.time())}"
             client_id_sell = f"mm_s_{market.ticker[-8:]}_{int(time.time())}"
             
@@ -151,19 +190,26 @@ class HftEngine:
             asyncio.create_task(self.kalshi.place_order(market.ticker, "sell", max_contracts_ask, my_ask, client_id_sell, order_type="limit"))
 
     async def discover_and_set_markets(self):
-        """Discover top N markets and set engine state."""
+        """Discover top N markets across all tier-enabled cryptos."""
         from core.telegram import send_telegram_market_switch
-        
-        spot = await get_btc_price()
-        if spot <= 0:
-            logger.error("Failed to fetch BTC spot price.")
-            return False
         
         self.iv = await get_btc_dvol()
         
-        top_markets = await self.scanner.select_top_n_markets(spot, iv=self.iv, n=NUM_MARKETS)
+        # Use multi-crypto scanner with tier-appropriate series
+        top_markets = await self.scanner.scan_all_cryptos(
+            n=self.tier_max_markets,
+            series_list=self.tier_series,
+            btc_iv=self.iv
+        )
+        
         if not top_markets:
-            logger.error("No suitable markets found.")
+            # Fallback to BTC-only scan
+            spot = await get_btc_price()
+            if spot > 0:
+                top_markets = await self.scanner.select_top_n_markets(spot, iv=self.iv, n=self.tier_max_markets)
+        
+        if not top_markets:
+            logger.error("No suitable markets found across any crypto.")
             return False
         
         old_tickers = set(m.ticker for m in self.markets)
@@ -171,23 +217,27 @@ class HftEngine:
         
         # Build new market objects
         new_market_objs = []
+        needed_symbols = set()
         for mkt in top_markets:
+            sym = mkt.get("binance_symbol", "BTCUSDT")
+            needed_symbols.add(sym)
             new_market_objs.append(ActiveMarket(
                 ticker=mkt["ticker"],
                 strike=mkt["strike"],
                 expiry_dt=mkt.get("expiry_dt"),
                 fair_value_cents=mkt.get("fair_value_cents", 0),
                 event_ticker=mkt.get("event_ticker", ""),
+                binance_symbol=sym,
+                crypto_name=mkt.get("crypto_name", "BTC"),
             ))
         
         self.markets = new_market_objs
         
-        # Initialize Binance WS for the correct crypto
-        binance_symbol = top_markets[0].get("binance_symbol", "BTCUSDT")
-        if not self.binance_ws or self.binance_ws.symbol != binance_symbol.lower():
-            self._init_binance_ws(binance_symbol)
+        # Initialize Binance WS feeds for all needed crypto symbols
+        for sym in needed_symbols:
+            self._get_binance_ws(sym)
         
-        # Switch Kalshi WS subscriptions
+        # Switch Kalshi WS subscriptions incrementally
         tickers_to_unsub = old_tickers - new_tickers
         tickers_to_sub = new_tickers - old_tickers
         
@@ -204,17 +254,15 @@ class HftEngine:
                 except Exception:
                     pass
         
-        # Log and notify
+        # Log summary
         for mkt in self.markets:
-            fv = mkt.last_fair_value
             logger.info(
-                f"✅ Active: {mkt.ticker} | above ${mkt.strike:,.0f} | "
-                f"FV: {fv}c | Exp: {mkt.get_days_to_expiry()*24:.1f}h"
+                f"✅ [{mkt.crypto_name}] {mkt.ticker} | ${mkt.strike:,.0f} | "
+                f"FV: {mkt.last_fair_value}c | Exp: {mkt.get_days_to_expiry()*24:.1f}h"
             )
         
         if new_tickers != old_tickers:
-            # Send one consolidated Telegram notification
-            market_list = " | ".join(f"{m.ticker} ({m.last_fair_value}c)" for m in self.markets)
+            market_list = " | ".join(f"[{m.crypto_name}] {m.ticker} ({m.last_fair_value}c)" for m in self.markets)
             await send_telegram_market_switch(
                 market_list, 
                 self.markets[0].strike,
@@ -222,14 +270,15 @@ class HftEngine:
                 self.markets[0].last_fair_value
             )
         
-        logger.info(f"💰 Capital: ${self.max_capital:.2f} | ${self.max_capital/max(len(self.markets),1):.2f} per market")
+        cap_per = self.max_capital / max(len(self.markets), 1)
+        logger.info(f"💰 ${self.max_capital:.2f} total | ${cap_per:.2f}/market | {len(self.markets)} markets | {len(needed_symbols)} cryptos")
         return True
 
     async def market_rescan_loop(self):
         """Periodically re-scan for better markets."""
         while True:
             await asyncio.sleep(MARKET_RESCAN_INTERVAL)
-            logger.info(f"🔎 Market re-scan triggered (every {MARKET_RESCAN_INTERVAL//60}min)...")
+            logger.info(f"🔎 Market re-scan ({MARKET_RESCAN_INTERVAL//60}min)...")
             try:
                 await self.discover_and_set_markets()
             except Exception as e:
@@ -251,48 +300,61 @@ class HftEngine:
         """Send a telegram heartbeat every 6 hours."""
         from core.telegram import send_telegram_heartbeat, send_telegram_pnl
         while True:
-            market_summary = ", ".join(f"{m.ticker}({m.last_fair_value}c)" for m in self.markets) or "none"
+            market_summary = ", ".join(f"[{m.crypto_name}]{m.ticker}({m.last_fair_value}c)" for m in self.markets) or "none"
             await send_telegram_heartbeat(market_summary, len(self.markets))
             await send_telegram_pnl(self.deployed_capital, 0.0) 
             await asyncio.sleep(60 * 60 * 6)
 
     async def run(self):
-        logger.info(f"Starting HFT Engine | Multi-market mode ({NUM_MARKETS} simultaneous)...")
-        
-        # 1. Fetch portfolio balance
+        # 1. Fetch balance and determine tier
         await self.fetch_balance()
         if self.max_capital <= 0:
-            logger.error("FATAL: Portfolio balance is $0. Cannot trade.")
+            logger.error("FATAL: Portfolio balance is $0.")
             return
         
-        # 2. Discover top N markets
+        logger.info(
+            f"Starting HFT Engine | Balance: ${self.max_capital:.2f} | "
+            f"Tier: {self.tier_max_markets} markets, {self.tier_series}"
+        )
+        
+        # 2. Discover markets using tier-appropriate crypto list
         success = await self.discover_and_set_markets()
         if not success:
-            logger.error("FATAL: Could not discover any active markets. Exiting.")
+            logger.error("FATAL: No active markets found.")
             return
         
-        # 3. Reconcile existing positions  
+        # 3. Reconcile positions
         await self.reconcile_positions()
         
-        # 4. Run all event loops concurrently
+        # 4. Run all event loops
         all_tickers = [m.ticker for m in self.markets]
-        logger.info(f"Launching all event loops | {len(self.markets)} markets | Capital: ${self.max_capital:.2f}")
-        await asyncio.gather(
-            self.binance_ws.connect(),
+        
+        # Gather all coroutines: Binance WS per crypto + Kalshi WS + loops
+        tasks = [
             self.kalshi.connect_ws(all_tickers, self.l2_store),
             self.heartbeat_loop(),
             self.market_rescan_loop(),
             self.iv_and_balance_refresh_loop(),
+        ]
+        
+        # Add one Binance WS per needed crypto symbol
+        for sym, ws in self.binance_feeds.items():
+            tasks.append(ws.connect())
+        
+        cryptos = set(m.crypto_name for m in self.markets)
+        logger.info(
+            f"Launching {len(tasks)} tasks | {len(self.markets)} markets | "
+            f"Cryptos: {', '.join(cryptos)} | Capital: ${self.max_capital:.2f}"
         )
+        await asyncio.gather(*tasks)
 
 async def main():
     load_dotenv()
     engine = HftEngine()
-    
     try:
         await engine.run()
     except KeyboardInterrupt:
-        logger.info("Shutting down scalper.")
+        logger.info("Shutting down.")
     finally:
         await engine.kalshi.close()
 

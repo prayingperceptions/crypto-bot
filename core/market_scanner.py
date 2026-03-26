@@ -8,12 +8,13 @@ from core.black_scholes import calculate_probability_above_strike
 logger = setup_logger("market_scanner")
 
 # Kalshi crypto series tickers (hourly snapshot events with tail markets)
-# KXBTCD = BTC daily/hourly tails, KXETHD = ETH, etc.
 CRYPTO_SERIES = {
     "KXBTCD": {"name": "BTC", "binance_symbol": "BTCUSDT"},
-    # Future expansion:
-    # "KXETHD": {"name": "ETH", "binance_symbol": "ETHUSDT"},
-    # "KXSOLD": {"name": "SOL", "binance_symbol": "SOLUSDT"},
+    "KXETHD": {"name": "ETH", "binance_symbol": "ETHUSDT"},
+    "KXSOLD": {"name": "SOL", "binance_symbol": "SOLUSDT"},
+    "KXXRP":  {"name": "XRP", "binance_symbol": "XRPUSDT"},
+    "KXBNB":  {"name": "BNB", "binance_symbol": "BNBUSDT"},
+    "KXHYPE": {"name": "HYPE", "binance_symbol": "HYPEUSDT"},
 }
 
 # Minimum open interest to consider a market (proxy for volume)
@@ -213,6 +214,79 @@ class MarketScanner:
         
         return top_n
 
+    async def _get_spot_price(self, binance_symbol: str) -> float:
+        """Get spot price from Binance REST API for any crypto."""
+        import aiohttp
+        try:
+            url = f"https://api.binance.us/api/v3/ticker/price?symbol={binance_symbol}"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return float(data.get("price", 0))
+        except Exception as e:
+            logger.error(f"Failed to get {binance_symbol} price: {e}")
+        return 0.0
+
+    async def scan_all_cryptos(self, n: int = 3, 
+                                series_list: list | None = None,
+                                btc_iv: float = 50.0) -> List[Dict[str, Any]]:
+        """
+        Scan across all enabled crypto series and return the top N markets globally.
+        Each crypto uses its own spot price from Binance.
+        IV defaults to 50% for non-BTC (Deribit only has BTC/ETH DVOL).
+        """
+        if series_list is None:
+            series_list = list(CRYPTO_SERIES.keys())
+        
+        all_candidates = []
+        
+        for series_ticker in series_list:
+            info = CRYPTO_SERIES.get(series_ticker)
+            if not info:
+                continue
+            
+            # Get spot price for this crypto
+            spot = await self._get_spot_price(info["binance_symbol"])
+            if spot <= 0:
+                logger.warning(f"No spot price for {info['name']}, skipping {series_ticker}")
+                continue
+            
+            # Use BTC IV for BTC, default 50% for others (close enough for MM)
+            iv = btc_iv if series_ticker == "KXBTCD" else 50.0
+            
+            candidates = await self._collect_candidates(spot, iv, series_ticker, max_events=3)
+            all_candidates.extend(candidates)
+            
+            logger.info(f"  {info['name']}: {len(candidates)} tradeable markets (spot ${spot:,.2f})")
+        
+        if not all_candidates:
+            logger.warning("No tradeable markets found across any crypto.")
+            return []
+        
+        # Group by event_ticker, pick best per event
+        by_event: Dict[str, List[Dict[str, Any]]] = {}
+        for c in all_candidates:
+            evt = c["event_ticker"]
+            by_event.setdefault(evt, []).append(c)
+        
+        selected = []
+        for evt, markets in by_event.items():
+            markets.sort(key=lambda c: (c["distance_from_50"], -c["open_interest"]))
+            selected.append(markets[0])
+        
+        # Sort by closest to 50c fair value, take top N
+        selected.sort(key=lambda c: (c["distance_from_50"], -c["open_interest"]))
+        top_n = selected[:n]
+        
+        for i, m in enumerate(top_n):
+            logger.info(
+                f"✅ Global #{i+1}: [{m['crypto_name']}] {m['ticker']} | "
+                f"FV: {m['fair_value_cents']}c | OI: {m['open_interest']:,.0f} | "
+                f"Exp: {m['days_to_expiry']*24:.1f}h"
+            )
+        
+        return top_n
+
     async def close(self):
         await self.kalshi.close()
-

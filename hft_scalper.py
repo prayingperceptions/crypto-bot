@@ -13,9 +13,8 @@ from core.deribit import get_btc_dvol, get_btc_price
 logger = setup_logger("hft_scalper")
 
 # Production Params 
-MAX_CAPITAL_RISK_USD = 50.0  # Max exposure $50
 MAX_SLIPPAGE_CENTS = 2  # Max slippage tolerance
-TRADE_FRACTION = 0.10  # Max 10% of base per trade ($5.00)
+TRADE_FRACTION = 0.10  # Max 10% of balance per trade
 MARKET_RESCAN_INTERVAL = 900  # Re-scan every 15 min (events are hourly)
 
 class HftEngine:
@@ -32,7 +31,8 @@ class HftEngine:
         self.expiry_dt: datetime | None = None
         self.iv: float = 50.0  # Will be replaced by live DVOL
         
-        # Risk State
+        # Risk State — balance fetched dynamically from Kalshi
+        self.max_capital: float = 0.0  # Set from portfolio balance on boot
         self.deployed_capital = 0.0
         self.active_positions = 0
         
@@ -97,6 +97,23 @@ class HftEngine:
         prob = calculate_probability_above_strike(spot, self.target_strike, days, self.iv)
         return int(prob * 100)
 
+    async def fetch_balance(self):
+        """Fetch live portfolio balance from Kalshi and use as capital limit."""
+        try:
+            resp = await self.kalshi.get_balance()
+            # Kalshi returns balance in cents or dollars depending on endpoint
+            balance = float(resp.get("balance", 0))
+            # If balance looks like cents (> 100), convert to dollars
+            if balance > 100:
+                balance = balance / 100.0
+            if balance > 0:
+                self.max_capital = balance
+                logger.info(f"💰 Portfolio balance: ${self.max_capital:.2f}")
+            else:
+                logger.warning(f"Could not fetch balance, using current: ${self.max_capital:.2f}")
+        except Exception as e:
+            logger.error(f"Balance fetch failed: {e}")
+
     def evaluate_trade_trigger(self, binance_price: float, k_bid: int, k_bid_qty: int, k_ask: int, k_ask_qty: int):
         # 1. Fair Value from Black-Scholes with live IV & real expiry
         fair_value_cents = self._compute_fair_value_cents(binance_price)
@@ -117,8 +134,10 @@ class HftEngine:
             )
             self.last_fair_value = fair_value_cents
             
-            # Deploy 10% of max capital ($5) into each side
-            target_trade_usd = MAX_CAPITAL_RISK_USD * TRADE_FRACTION
+            # Deploy 10% of portfolio balance into each side
+            target_trade_usd = self.max_capital * TRADE_FRACTION
+            if target_trade_usd <= 0:
+                return  # No capital available
             max_contracts_bid = int((target_trade_usd * 100) / my_bid) if my_bid > 0 else 0
             max_contracts_ask = int((target_trade_usd * 100) / my_ask) if my_ask > 0 else 0
             
@@ -180,16 +199,17 @@ class HftEngine:
             except Exception as e:
                 logger.error(f"Market re-scan failed: {e}")
 
-    async def iv_refresh_loop(self):
-        """Refresh DVOL every 15 minutes for accuracy."""
+    async def iv_and_balance_refresh_loop(self):
+        """Refresh DVOL and portfolio balance every 15 minutes."""
         while True:
             await asyncio.sleep(900)
             try:
                 new_iv = await get_btc_dvol()
                 if new_iv > 0:
                     self.iv = new_iv
+                await self.fetch_balance()
             except Exception as e:
-                logger.error(f"IV refresh failed: {e}")
+                logger.error(f"IV/balance refresh failed: {e}")
 
     async def heartbeat_loop(self):
         """Send a telegram heartbeat every 6 hours."""
@@ -202,23 +222,29 @@ class HftEngine:
     async def run(self):
         logger.info("Starting HFT Engine with dynamic market discovery...")
         
-        # 1. Discover best market on boot
+        # 1. Fetch portfolio balance
+        await self.fetch_balance()
+        if self.max_capital <= 0:
+            logger.error("FATAL: Portfolio balance is $0. Cannot trade.")
+            return
+        
+        # 2. Discover best market on boot
         success = await self.discover_and_set_market()
         if not success:
             logger.error("FATAL: Could not discover any active market. Exiting.")
             return
         
-        # 2. Reconcile existing positions  
+        # 3. Reconcile existing positions  
         await self.reconcile_positions()
         
-        # 3. Run all event loops concurrently
-        logger.info(f"Launching all event loops for market: {self.target_market}")
+        # 4. Run all event loops concurrently
+        logger.info(f"Launching all event loops | Market: {self.target_market} | Capital: ${self.max_capital:.2f}")
         await asyncio.gather(
             self.binance_ws.connect(),
             self.kalshi.connect_ws([self.target_market], self.l2_store),
             self.heartbeat_loop(),
             self.market_rescan_loop(),
-            self.iv_refresh_loop(),
+            self.iv_and_balance_refresh_loop(),
         )
 
 async def main():

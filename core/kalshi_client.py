@@ -149,6 +149,34 @@ class KalshiClient:
         logger.info(f"Submitting Kalshi Order: {payload}")
         return await self._request("POST", path, json=payload)
 
+    async def get_open_orders(self, ticker: str = "") -> List[Dict[str, Any]]:
+        """Fetch open orders, optionally filtered by market ticker."""
+        path = "/portfolio/orders?status=resting"
+        if ticker:
+            path += f"&ticker={ticker}"
+        resp = await self._request("GET", path)
+        return resp.get("orders", [])
+
+    async def cancel_order(self, order_id: str) -> Dict[str, Any]:
+        """Cancel a single order by ID."""
+        return await self._request("DELETE", f"/portfolio/orders/{order_id}")
+
+    async def cancel_orders_for_market(self, ticker: str) -> int:
+        """Cancel all resting orders for a specific market. Returns count cancelled."""
+        orders = await self.get_open_orders(ticker)
+        cancelled = 0
+        for order in orders:
+            oid = order.get("order_id")
+            if oid:
+                try:
+                    await self.cancel_order(oid)
+                    cancelled += 1
+                except Exception:
+                    pass
+        if cancelled > 0:
+            logger.info(f"Cancelled {cancelled} stale orders for {ticker}")
+        return cancelled
+
     async def connect_ws(self, market_tickers: List[str], l2_store: Any):
         """Connect to Kalshi WebSocket with auto-reconnect. Stores ws for resubscription."""
         self._ws = None

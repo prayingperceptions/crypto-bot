@@ -67,6 +67,9 @@ class HftEngine:
         # Current tier settings
         self.tier_max_markets: int = 1
         self.tier_series: list[str] = ["KXBTCD"]
+        
+        # Rolling price history for dynamic spread (keyed by market ticker)
+        self._price_history: dict[str, list[tuple[float, float]]] = {}
 
     def _get_tier(self) -> tuple[int, list[str]]:
         """Determine current capital tier based on portfolio balance."""
@@ -155,20 +158,62 @@ class HftEngine:
         except Exception as e:
             logger.error(f"Balance fetch failed: {e}")
 
+    def _compute_dynamic_spread(self, market: ActiveMarket, spot: float) -> int:
+        """
+        Dynamic spread that widens based on:
+        1. Time to expiry (closer = more gamma risk = wider spread)
+        2. Recent price volatility (more volatile = wider spread)
+        Returns spread in cents per side (e.g., 2 = bid at FV-2, ask at FV+2).
+        """
+        base_spread = 2  # Default 2¢ per side
+        
+        # 1. Gamma adjustment: widen near expiry (last 30 min is dangerous)
+        hours_left = market.get_days_to_expiry() * 24
+        if hours_left < 0.25:      # < 15 min
+            base_spread += 3
+        elif hours_left < 0.5:     # < 30 min
+            base_spread += 2
+        elif hours_left < 1.0:     # < 1 hour
+            base_spread += 1
+        
+        # 2. Volatility adjustment: track recent price moves
+        now = time.time()
+        key = market.ticker
+        if key not in self._price_history:
+            self._price_history[key] = []
+        
+        self._price_history[key].append((now, spot))
+        # Keep last 5 minutes only
+        cutoff = now - 300
+        self._price_history[key] = [(t, p) for t, p in self._price_history[key] if t > cutoff]
+        
+        prices = [p for _, p in self._price_history[key]]
+        if len(prices) >= 2:
+            pct_move = abs(max(prices) - min(prices)) / min(prices) * 100
+            if pct_move > 1.0:      # > 1% in 5 min = very volatile
+                base_spread += 3
+            elif pct_move > 0.5:    # > 0.5%
+                base_spread += 2
+            elif pct_move > 0.2:    # > 0.2%
+                base_spread += 1
+        
+        return min(base_spread, 8)  # Cap at 8¢ per side
+
     def evaluate_trade_trigger(self, market: ActiveMarket, binance_price: float, 
                                 k_bid: int, k_bid_qty: int, k_ask: int, k_ask_qty: int):
         fair_value_cents = self._compute_fair_value_cents(market, binance_price)
         if fair_value_cents is None:
             return
         
-        my_bid = max(1, fair_value_cents - 2)
-        my_ask = min(99, fair_value_cents + 2)
+        spread = self._compute_dynamic_spread(market, binance_price)
+        my_bid = max(1, fair_value_cents - spread)
+        my_ask = min(99, fair_value_cents + spread)
         
         if abs(fair_value_cents - market.last_fair_value) >= 1:
             hours_left = market.get_days_to_expiry() * 24
             logger.info(
                 f"🔄 [{market.crypto_name}] {market.ticker} | FV: {fair_value_cents}c | "
-                f"Exp: {hours_left:.1f}h -> BID: {my_bid}c | ASK: {my_ask}c"
+                f"Spread: ±{spread}c | Exp: {hours_left:.1f}h -> BID: {my_bid}c | ASK: {my_ask}c"
             )
             market.last_fair_value = fair_value_cents
             
@@ -183,11 +228,17 @@ class HftEngine:
             if max_contracts_bid <= 0 and max_contracts_ask <= 0:
                 return
             
-            client_id_buy = f"mm_b_{market.ticker[-8:]}_{int(time.time())}"
-            client_id_sell = f"mm_s_{market.ticker[-8:]}_{int(time.time())}"
+            # Cancel stale orders, then post new ones
+            async def _cancel_and_replace():
+                await self.kalshi.cancel_orders_for_market(market.ticker)
+                
+                client_id_buy = f"mm_b_{market.ticker[-8:]}_{int(time.time())}"
+                client_id_sell = f"mm_s_{market.ticker[-8:]}_{int(time.time())}"
+                
+                await self.kalshi.place_order(market.ticker, "buy", max_contracts_bid, my_bid, client_id_buy, order_type="limit")
+                await self.kalshi.place_order(market.ticker, "sell", max_contracts_ask, my_ask, client_id_sell, order_type="limit")
             
-            asyncio.create_task(self.kalshi.place_order(market.ticker, "buy", max_contracts_bid, my_bid, client_id_buy, order_type="limit"))
-            asyncio.create_task(self.kalshi.place_order(market.ticker, "sell", max_contracts_ask, my_ask, client_id_sell, order_type="limit"))
+            asyncio.create_task(_cancel_and_replace())
 
     async def discover_and_set_markets(self):
         """Discover top N markets across all tier-enabled cryptos."""
@@ -214,6 +265,14 @@ class HftEngine:
         
         old_tickers = set(m.ticker for m in self.markets)
         new_tickers = set(m["ticker"] for m in top_markets)
+        
+        # Cancel all orders on markets we're leaving
+        retired_tickers = old_tickers - new_tickers
+        for ticker in retired_tickers:
+            try:
+                await self.kalshi.cancel_orders_for_market(ticker)
+            except Exception:
+                pass
         
         # Build new market objects
         new_market_objs = []

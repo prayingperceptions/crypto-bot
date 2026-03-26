@@ -1,44 +1,84 @@
-# Kalshi Crypto Arb Bot 🤖📈
+# Kalshi Crypto Market Maker 🤖📈
 
-An asynchronous, low-latency cryptocurrency prediction market trading bot specifically built for [Kalshi](https://kalshi.com). 
+An autonomous, low-latency cryptocurrency prediction market maker built for [Kalshi](https://kalshi.com). 
 
-It rapidly fetches sub-100ms Spot L1 data from Binance.US, feeds it through a customized Black-Scholes probability model to determine the exact 'Fair Value' of a Kalshi contract, and autonomously posts optimized BID and ASK limit orders on Kalshi to farm the spread.
+The bot dynamically discovers live crypto markets, computes fair values using Black-Scholes pricing with live implied volatility from Deribit, and posts optimized bid/ask limit orders to farm the spread — 24/7, fully hands-off.
 
-## Core Architecture
-- **`hft_scalper.py`**: The High-Frequency Trading engine. Runs the primary `asyncio` loop handling Binance websockets, Kalshi WebSockets, L2 Orderbook reconstruction, and firing limit orders dynamically.
-- **`core/kalshi_client.py`**: Robust async REST/WebSocket wrapper for the Kalshi API, fully integrated with RSA-PSS private key signatures and exponential backoff auto-healing.
-- **`core/db.py`**: Local SQLite Trade Ledger. Safely tracks your active positions so nothing is lost during restarts.
-- **`core/telegram.py`**: Live reporting module. Pushes out 6-hour system health heartbeats and trade updates straight to your phone.
+## How It Works
 
-## Security & Risk Parameters
-- **$50 Max Exposure**: The bot has a hard-coded global circuit breaker preventing it from ever putting more than $50 at risk simultaneously.
-- **Hard Stop Loss**: If Kalshi's fair value bleeds rapidly beyond our baseline thresholds, the bot abandons limit orders and market-sells its inventory into the bids to evacuate the position instantly.
-- **Zero Exposed Keys**: All keys operate entirely out of a local `.env` and `kalshi.key` config hidden from version control.
+1. **Market Discovery** — Scans Kalshi's `KXBTCD` hourly events via the Events API, fetches all tail markets ("BTC above $X"), and selects the one with fair value closest to 50¢ and sufficient open interest
+2. **Fair Value Engine** — Feeds sub-100ms Binance spot prices through Black-Scholes with live DVOL (implied volatility from Deribit) and real time-to-expiry
+3. **Market Making** — Posts BID (fair value - 2¢) and ASK (fair value + 2¢) limit orders. Profits from the 4¢ spread when both sides fill
+4. **Auto-Rotation** — Rescans every 15 min, seamlessly switches to the next hourly event before the current one expires (including WS resubscription)
+5. **Dynamic Sizing** — Fetches live portfolio balance from Kalshi, sizes orders at 10% of total balance per side. As profits compound, order sizes scale automatically
 
-## Deployment Instructions
+## Architecture
 
-### 1. Requirements
-- A Kalshi account with API access enabled (Production).
-- A `.env` file populated with your Telegram keys.
-- A `kalshi.key` file housing your raw Kalshi RSA private key.
+```
+┌─────────────┐     ┌──────────────┐     ┌──────────────────┐
+│ Binance WS   │────▶│  HFT Engine  │────▶│  Kalshi REST/WS  │
+│ (BTCUSDT L1) │     │ Black-Scholes│     │  (Orders + L2)   │
+└─────────────┘     └──────┬───────┘     └──────────────────┘
+                           │
+              ┌────────────┼────────────┐
+              ▼            ▼            ▼
+        ┌──────────┐ ┌──────────┐ ┌──────────┐
+        │ Deribit   │ │ Scanner  │ │ Telegram │
+        │ (DVOL/IV) │ │ (Events) │ │ (Alerts) │
+        └──────────┘ └──────────┘ └──────────┘
+```
 
-### 2. Run Locally (Docker)
-Ensure Docker is installed on your machine, then run:
+### Core Files
+| File | Purpose |
+|------|---------|
+| `hft_scalper.py` | Main engine — Binance WS, fair value calc, order posting, market rotation |
+| `core/market_scanner.py` | Dynamic market discovery via Kalshi Events API (multi-crypto ready) |
+| `core/kalshi_client.py` | Async REST + WebSocket client with RSA-PSS auth and auto-reconnect |
+| `core/black_scholes.py` | Fair value probability calculator (above-strike + in-range) |
+| `core/deribit.py` | Live BTC spot price and DVOL (implied volatility) from Deribit |
+| `core/telegram.py` | Heartbeat, market switch, and PnL notifications |
+| `core/db.py` | SQLite trade ledger for position tracking across restarts |
+
+## Risk Controls
+- **Dynamic Capital Limit** — Uses full Kalshi portfolio balance, refreshed every 15 min
+- **10% Per-Trade Sizing** — Each order deploys max 10% of balance per side
+- **Hard Stop Loss** — If fair value drops below 15¢ while holding YES, market-sells immediately
+- **Auto-Reconnect** — Both Kalshi and Binance WebSockets reconnect on disconnect (5s backoff)
+- **Zero Exposed Keys** — All secrets via environment variables, gitignored
+
+## Multi-Crypto Ready
+The `CRYPTO_SERIES` dict in `market_scanner.py` is ready for expansion:
+```python
+CRYPTO_SERIES = {
+    "KXBTCD": {"name": "BTC", "binance_symbol": "BTCUSDT"},
+    # "KXETHD": {"name": "ETH", "binance_symbol": "ETHUSDT"},
+    # "KXSOLD": {"name": "SOL", "binance_symbol": "SOLUSDT"},
+}
+```
+
+## Deployment
+
+### Requirements
+- Kalshi account with API access (Production)
+- Kalshi RSA private key
+- Telegram bot token + chat ID
+
+### Run on Railway 🚂
+1. Link this GitHub repo to a new Railway project
+2. Railway auto-detects the `Dockerfile` and `Procfile`
+3. Add environment variables:
+   - `KALSHI_API_KEY`
+   - `KALSHI_PRIVATE_KEY` (raw PEM content)
+   - `TELEGRAM_BOT_TOKEN`
+   - `TELEGRAM_CHAT_ID`
+4. Deploy — you'll receive a Telegram heartbeat within 60 seconds
+
+### Run Locally (Docker)
 ```bash
 docker-compose up -d --build
 ```
 
-### 3. Run on Railway 🚂
-1. Link this GitHub repo directly to a new Railway project.
-2. Railway will instantly detect the included `Dockerfile` and `Procfile`.
-3. Go to the project **Variables** tab and inject:
-   - `KALSHI_API_KEY`
-   - `KALSHI_PRIVATE_KEY`
-   - `TELEGRAM_BOT_TOKEN`
-   - `TELEGRAM_CHAT_ID`
-4. The container will automatically spin up and you'll receive a Telegram heartbeat!
-
 ## Disclaimer
 This is automated trading software. Prediction markets and cryptocurrency are highly volatile. Never run this with more capital than you are willing to lose.
 
-All glory to Jesus 
+All glory to Jesus
